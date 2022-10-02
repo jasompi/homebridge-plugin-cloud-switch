@@ -1,35 +1,58 @@
-import { API, DynamicPlatformPlugin, Logger, PlatformAccessory, PlatformConfig, Service, Characteristic } from 'homebridge';
+import { API, APIEvent, DynamicPlatformPlugin, Logger, PlatformAccessory, PlatformConfig } from 'homebridge';
 
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
-import { ExamplePlatformAccessory } from './platformAccessory';
+import { SwitchAccessory, SwitchConfig } from './platformAccessory';
+import { CloudSwitch } from 'cloud-switch-js';
 
-/**
- * HomebridgePlatform
- * This class is the main constructor for your plugin, this is where you should
- * parse the user config and discover/register accessories with Homebridge.
- */
-export class ExampleHomebridgePlatform implements DynamicPlatformPlugin {
-  public readonly Service: typeof Service = this.api.hap.Service;
-  public readonly Characteristic: typeof Characteristic = this.api.hap.Characteristic;
+export interface CloudSwitchPlatformConfig extends PlatformConfig {
+  accessToken: string;
+  deviceId: string;
+  excludedSwitches: string;
+}
 
+export class CloudSwitchHomebridgePlatform implements DynamicPlatformPlugin {
   // this is used to track restored cached accessories
-  public readonly accessories: PlatformAccessory[] = [];
+  private readonly accessories: PlatformAccessory[] = [];
+  // switch published to HomeKit
+  private switchAccessories: (SwitchAccessory | undefined)[] = [];
+  private readonly config: CloudSwitchPlatformConfig;
+  // Switch indexes to be excluded. (Not published to HomeKit)
+  private readonly excludedSwitches: Set<number>;
+  private cloudSwitch: CloudSwitch | null = null;
+  private switchConfigTimestamp = 0;
 
   constructor(
-    public readonly log: Logger,
-    public readonly config: PlatformConfig,
-    public readonly api: API,
+    private readonly log: Logger,
+    config: PlatformConfig,
+    private readonly api: API,
   ) {
-    this.log.debug('Finished initializing platform:', this.config.name);
-
+    this.log.debug('Finished initializing platform:', config.name);
+    this.config = config as CloudSwitchPlatformConfig;
+    if (this.config.excludedSwitches) {
+      this.excludedSwitches = new Set(this.config.excludedSwitches.split(',').map((index: string) => Number(index)));
+    } else {
+      this.excludedSwitches = new Set();
+    }
     // When this event is fired it means Homebridge has restored all cached accessories from disk.
     // Dynamic Platform plugins should only register new accessories after this event was fired,
     // in order to ensure they weren't added to homebridge already. This event can also be used
     // to start discovery of new accessories.
-    this.api.on('didFinishLaunching', () => {
-      log.debug('Executed didFinishLaunching callback');
+    this.api.on(APIEvent.DID_FINISH_LAUNCHING, () => {
+      log.debug('CloudSwitch didFinishLaunching');
       // run the method to discover / register your devices as accessories
-      this.discoverDevices();
+      this.discoverDevices().then(() => log.debug('discoverDevices completed')).catch((error) => {
+        log.error('discoverDevices failed', error);
+        if (error instanceof this.api.hap.HapStatusError) {
+          throw error;
+        }
+        throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      });
+    });
+
+    this.api.on(APIEvent.SHUTDOWN, () => {
+      this.log.info('CloudSwitch shutdown');
+      this.cloudSwitch?.onSwitchConfigChanged(undefined);
+      this.cloudSwitch?.onSwitchStateChanged(undefined);
     });
   }
 
@@ -49,68 +72,136 @@ export class ExampleHomebridgePlatform implements DynamicPlatformPlugin {
    * Accessories must only be registered once, previously created accessories
    * must not be registered again to prevent "duplicate UUID" errors.
    */
-  discoverDevices() {
+  async discoverDevices(): Promise<void> {
+    const config = this.config as CloudSwitchPlatformConfig;
+    this.cloudSwitch = await CloudSwitch.createCloudSwitchForId(config.deviceId, config.accessToken);
 
-    // EXAMPLE ONLY
-    // A real plugin you would discover accessories from the local network, cloud services
-    // or a user-defined array in the platform config.
-    const exampleDevices = [
-      {
-        exampleUniqueId: 'ABCD',
-        exampleDisplayName: 'Bedroom',
-      },
-      {
-        exampleUniqueId: 'EFGH',
-        exampleDisplayName: 'Kitchen',
-      },
-    ];
+    if (!this.cloudSwitch.isOnline()) {
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+    }
+    this.cloudSwitch.onSwitchConfigChanged((timestamp) => {
+      if (timestamp > this.switchConfigTimestamp) {
+        this.log.info(`switchConfigChanged to ${timestamp}`);
+        this.setupAccessaries().catch((reason) => {
+          this.log.error(`Failed to setupAccessary for updated switchConfig ${timestamp}, reason:`, reason);
+        });
+      }
+    });
+    await this.cloudSwitch.onSwitchStateChanged(this.switchStateUpdated.bind(this));
+    await this.setupAccessaries();
+  }
 
-    // loop over the discovered devices and register each one if it has not already been registered
-    for (const device of exampleDevices) {
+  async setupAccessaries(): Promise<void> {
+    if (this.cloudSwitch === undefined) {
+      this.log.error('Cloud Switch is not setup');
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+    }
+    const switchConfig = await this.cloudSwitch!.getSwitchConfig();
+    if (!(switchConfig.names instanceof Array) || !(switchConfig.codes instanceof Array)) {
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.RESOURCE_DOES_NOT_EXIST);
+    }
 
-      // generate a unique id for the accessory this should be generated from
-      // something globally unique, but constant, for example, the device serial
-      // number or MAC address
-      const uuid = this.api.hap.uuid.generate(device.exampleUniqueId);
+    const switchStates = await this.cloudSwitch!.switchStates();
 
-      // see if an accessory with the same uuid has already been registered and restored from
-      // the cached devices we stored in the `configureAccessory` method above
-      const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
-
-      if (existingAccessory) {
-        // the accessory already exists
-        this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
-
-        // if you need to update the accessory.context then you should run `api.updatePlatformAccessories`. eg.:
-        // existingAccessory.context.device = device;
-        // this.api.updatePlatformAccessories([existingAccessory]);
-
-        // create the accessory handler for the restored accessory
-        // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, existingAccessory);
-
-        // it is possible to remove platform accessories at any time using `api.unregisterPlatformAccessories`, eg.:
-        // remove platform accessories when no longer present
-        // this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
-        // this.log.info('Removing existing accessory from cache:', existingAccessory.displayName);
+    const newAccessaries: PlatformAccessory[] = [];
+    const existingAccessaries: PlatformAccessory[] = [];
+    for (let i = 0; i < switchConfig.names.length; i++) {
+      const name = switchConfig.names[i];
+      if (switchConfig.codes[i].length <= 0 || this.excludedSwitches.has(i)) {
+        this.log.debug(`Skip switch ${name}`);
+        this.switchAccessories[i] = undefined;
       } else {
-        // the accessory does not yet exist, so we need to create it
-        this.log.info('Adding new accessory:', device.exampleDisplayName);
+        // generate a unique id for the accessory this should be generated from
+        // something globally unique, but constant, for example, the device serial
+        // number or MAC address
+        const sericalNumber = `${this.cloudSwitch!.id()}:${i}`;
+        const uuid = this.api.hap.uuid.generate(sericalNumber);
 
-        // create a new accessory
-        const accessory = new this.api.platformAccessory(device.exampleDisplayName, uuid);
+        let accessory = this.accessories.find(accessory => accessory.UUID === uuid);
+        if (accessory) {
+          this.log.info(`Restoring existing accessory from cache: ${name}(${sericalNumber}) uuid: ${uuid}`);
+          accessory.displayName = name;
+          existingAccessaries.push(accessory);
+        } else {
+          // the accessory does not yet exist, so we need to create it
+          this.log.info(`Adding new accessory: ${name}(${sericalNumber}) uuid: ${uuid}`);
+
+          // create a new accessory
+          accessory = new this.api.platformAccessory(name, uuid);
+          newAccessaries.push(accessory);
+        }
+
+        const switchConfig: SwitchConfig = {
+          log: this.log,
+          name,
+          manufacture: 'JPi Mobile',
+          model: 'CS-2022',
+          sericalNumber,
+          initialState: switchStates[i],
+          turnOn: this.turnOnSwitch.bind(this, i),
+          turnOff: this.turnOffSwitch.bind(this, i),
+        };
 
         // store a copy of the device object in the `accessory.context`
         // the `context` property can be used to store any data about the accessory you may need
-        accessory.context.device = device;
+        accessory.context = switchConfig;
 
         // create the accessory handler for the newly create accessory
         // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, accessory);
-
-        // link the accessory to your platform
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.switchAccessories[i] = new SwitchAccessory(this.api, accessory);
       }
     }
+    this.log.debug('original ', this.accessories.map(acc => `${acc.displayName}(${acc.UUID})`));
+
+    // Unregiester accessaries
+    const accessories = this.accessories.filter(acc => !existingAccessaries.includes(acc));
+    this.log.debug('unregister ', accessories.map(acc => `${acc.displayName}(${acc.UUID})`));
+    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, accessories);
+
+    this.accessories.length = 0;
+    // Update cached accessories
+    this.log.debug('update ', existingAccessaries.map(acc => `${acc.displayName}(${acc.UUID})`));
+    this.api.updatePlatformAccessories(existingAccessaries);
+    this.accessories.push(...existingAccessaries);
+
+    this.log.debug('register ', newAccessaries.map(acc => `${acc.displayName}(${acc.UUID})`));
+    // Register new accessory to your platform
+    this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, newAccessaries);
+    this.accessories.push(...newAccessaries);
+
+    this.log.debug('new ', this.accessories.map(acc => `${acc.displayName}(${acc.UUID})`));
+
+    this.switchConfigTimestamp = switchConfig.timestamp;
   }
+
+  async switchStateUpdated(switchIndex: number, state: boolean) {
+    if (this.switchAccessories[switchIndex] !== undefined) {
+      this.switchAccessories[switchIndex]!.updateState(state);
+    }
+  }
+
+  async turnOnSwitch(switchIndex: number): Promise<boolean> {
+    if (this.cloudSwitch === undefined) {
+      this.log.error('Cloud Switch is not setup');
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+    }
+    if (this.switchAccessories[switchIndex] === undefined) {
+      this.log.error(`SwithIndex ${switchIndex} is not valid`);
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.INVALID_VALUE_IN_REQUEST);
+    }
+    return await this.cloudSwitch!.turnOnSwitch(switchIndex);
+  }
+
+  async turnOffSwitch(switchIndex: number): Promise<boolean> {
+    if (this.cloudSwitch === undefined) {
+      this.log.error('Cloud Switch is not setup');
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+    }
+    if (this.switchAccessories[switchIndex] === undefined) {
+      this.log.error(`SwithIndex ${switchIndex} is not valid`);
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.INVALID_VALUE_IN_REQUEST);
+    }
+    return await this.cloudSwitch!.turnOffSwitch(switchIndex);
+  }
+
 }

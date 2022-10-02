@@ -1,5 +1,5 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "Homebridge Cloud Switch",
   "pluginType": "platform",
   "singular": true,
   "schema": {
@@ -9,7 +9,25 @@
         "title": "Name",
         "type": "string",
         "required": true,
-        "default": "Example Dynamic Platform"
+        "default": "Cloud Switch"
+      },
+      "accessToken": {
+        "title": "Particle Cloud Access Token",
+        "type": "string",
+        "required": true,
+        "placeholder": "Input access token for particle.io account"
+      },
+      "deviceId": {
+        "title": "Cloud Switch Hub device ID",
+        "type": "string",
+        "required": true,
+        "placeholder": "Input the device ID for Cloud Switch"
+      },
+      "excludedSwitches": {
+        "title": "Switches excluded",
+        "type": "string",
+        "required": false,
+        "placeholder": "Comma separated list of switch indexes excluded"
       }
     }
   }
